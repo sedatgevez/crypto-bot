@@ -1,0 +1,218 @@
+import ccxt
+import pandas as pd
+import numpy as np
+import time
+import os
+import threading
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+import telebot
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+if not TOKEN:
+    print("❌ TELEGRAM_TOKEN environment variable bulunamadı!")
+    exit(1)
+
+bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
+CHAT_ID = 1026162739
+
+def send_telegram(message: str):
+    for attempt in range(3):
+        try:
+            bot.send_message(CHAT_ID, message)
+            return
+        except Exception as e:
+            print(f"❌ Telegram hatası (deneme {attempt + 1}): {e}")
+            time.sleep(2)
+    print("🚨 Telegram'a gönderilemedi.")
+
+def beep(freq: int, duration_ms: int):
+    pass
+
+THRESHOLD = 4.0
+FISH_LEN = 34
+RSI_LEN = 14
+RSI_OVERSOLD = 40
+RSI_OVERBOUGHT = 60
+MAX_WORKERS = 4
+SCAN_INTERVAL_MIN = 10
+STATUS_INTERVAL_MIN = 15
+
+WANTED_BASES = [
+    "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "DOT", "LINK",
+    "TON", "SUI", "NEAR", "TRX", "HBAR", "UNI", "APT", "ARB", "OP", "FET"
+]
+
+def get_timeframes_for_coin(coin):
+    if coin == "BTC":
+        return ['1h', '2h', '3h', '4h']
+    else:
+        return ['3h', '4h']
+
+def get_limit(tf: str) -> int:
+    limits = {'1h': 200, '2h': 150, '3h': 130, '4h': 120}
+    return limits.get(tf, 150)
+
+def make_exchange():
+    return ccxt.binanceusdm({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'future'}
+    })
+
+def resolve_futures_symbols(wanted_bases):
+    print("🔄 Binance Futures market listesi yükleniyor...")
+    ex = make_exchange()
+    markets = ex.load_markets()
+    available = {}
+    for symbol, info in markets.items():
+        if (info.get('quote') == 'USDT' and
+                info.get('type') in ('swap', 'future') and
+                info.get('active', True) and
+                not info.get('expiry')):
+            base = info.get('base')
+            if base:
+                available[base] = symbol
+    coins = [available[base] for base in wanted_bases if base in available]
+    print(f"✅ {len(coins)} coin futures olarak bulundu.")
+    return coins
+
+def fisher_transform(df, length=34):
+    hl2 = (df['high'] + df['low']) / 2.0
+    highest = hl2.rolling(window=length).max()
+    lowest = hl2.rolling(window=length).min()
+    hl2_arr = hl2.values
+    value = np.zeros(len(df))
+    fish = np.zeros(len(df))
+    for i in range(length, len(df)):
+        denom = max(highest.iloc[i] - lowest.iloc[i], 0.001)
+        raw = (hl2_arr[i] - lowest.iloc[i]) / denom - 0.5
+        value[i] = 0.66 * raw + 0.67 * value[i - 1]
+        v = min(max(value[i], -0.999), 0.999)
+        fish[i] = 0.5 * np.log((1 + v) / (1 - v)) + 0.5 * fish[i - 1]
+    return pd.Series(fish, index=df.index)
+
+def rsi(series, length=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi_series = 100 - (100 / (1 + rs))
+    return rsi_series.fillna(50)
+
+def get_signals_for_coin(coin, exchange):
+    results = []
+    timeframes = get_timeframes_for_coin(coin.split('/')[0])
+    for tf in timeframes:
+        try:
+            limit = get_limit(tf)
+            min_needed = FISH_LEN + RSI_LEN + 80
+            bars = exchange.fetch_ohlcv(coin, timeframe=tf, limit=max(limit, min_needed))
+            if len(bars) < min_needed:
+                continue
+            df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            ema12 = df['close'].ewm(span=12, adjust=False).mean()
+            ema26 = df['close'].ewm(span=26, adjust=False).mean()
+            macd_line = ema12 - ema26
+            fish = fisher_transform(df, FISH_LEN)
+            rsi_series = rsi(df['close'], RSI_LEN)
+            current_fish = fish.iloc[-1]
+            prev_fish = fish.iloc[-2]
+            current_macd = macd_line.iloc[-1]
+            prev_macd = macd_line.iloc[-2]
+            current_rsi = rsi_series.iloc[-1]
+            current_price = df['close'].iloc[-1]
+            base_dip = (current_fish < -THRESHOLD) and (current_fish > prev_fish) and (current_rsi < RSI_OVERSOLD)
+            base_tepe = (current_fish > THRESHOLD) and (current_fish < prev_fish) and (current_rsi > RSI_OVERBOUGHT)
+            dip_ok = base_dip and (current_macd > prev_macd) and (current_fish > prev_fish)
+            tepe_ok = base_tepe and (current_macd < prev_macd) and (current_fish < prev_fish)
+            results.append({
+                'coin': coin.split('/')[0].replace(':USDT', ''),
+                'symbol': coin,
+                'timeframe': tf,
+                'price': current_price,
+                'dip': dip_ok,
+                'tepe': tepe_ok,
+                'fish': round(current_fish, 3),
+                'rsi': round(current_rsi, 1),
+            })
+        except:
+            continue
+    return results
+
+def run_bot():
+    print("=" * 90)
+    print(" SedoXGIO Futures Bot — Render.com Edition")
+    print("=" * 90)
+    coins = resolve_futures_symbols(WANTED_BASES)
+    if not coins:
+        print("❌ Coin bulunamadı.")
+        send_telegram("❌ Bot başlatılamadı: Coin bulunamadı!")
+        return
+    last_signals = {}
+    loop_count = 0
+    last_status_time = time.time()
+    print(f"✅ Bot çalışıyor...")
+    send_telegram("🚀 **Bot başlatıldı!**")
+    thread_exchanges = [make_exchange() for _ in range(MAX_WORKERS)]
+    while True:
+        loop_count += 1
+        current_time = datetime.now().strftime('%H:%M:%S')
+        print(f"🔄 {current_time} — Döngü #{loop_count}")
+        t_start = time.time()
+        all_results = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures_map = {pool.submit(get_signals_for_coin, coin, thread_exchanges[i % MAX_WORKERS]): coin
+                           for i, coin in enumerate(coins)}
+            for future in as_completed(futures_map):
+                all_results.extend(future.result())
+        t_elapsed = time.time() - t_start
+        coin_signals = defaultdict(list)
+        for res in all_results:
+            coin_signals[res['coin']].append(res)
+        dip_count = 0
+        tepe_count = 0
+        for coin, signals in coin_signals.items():
+            for res in signals:
+                key = (res['symbol'], res['timeframe'])
+                price_str = f"${res['price']:.4f}" if res['price'] < 10 else f"${res['price']:.2f}"
+                if res.get('dip') and last_signals.get(key) != "DIP":
+                    msg = f"✅ **LONG** → `{res['coin']}` | {price_str} | `{res['timeframe']}`"
+                    print(msg)
+                    send_telegram(msg)
+                    last_signals[key] = "DIP"
+                elif res.get('tepe') and last_signals.get(key) != "TEPE":
+                    msg = f"✅ **SHORT** → `{res['coin']}` | {price_str} | `{res['timeframe']}`"
+                    print(msg)
+                    send_telegram(msg)
+                    last_signals[key] = "TEPE"
+        summary = f"🔎 **Tarama Tamamlandı**\n📊 Toplam Coin: {len(coins)}\n⏱ Süre: {t_elapsed:.1f} sn\n📈 LONG: {dip_count} | SHORT: {tepe_count}"
+        send_telegram(summary)
+        if time.time() - last_status_time > STATUS_INTERVAL_MIN * 60:
+            send_telegram(f"🟢 **Bot Aktif** | Döngü: {loop_count}")
+            last_status_time = time.time()
+        print(f"  Tarama süresi: {t_elapsed:.1f}s\n")
+        time.sleep(SCAN_INTERVAL_MIN * 60)
+
+if __name__ == "__main__":
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    run_bot()
